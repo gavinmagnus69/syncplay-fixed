@@ -84,7 +84,8 @@ class SyncFactory(Factory):
         if room:
             paused, position = room.isPaused(), room.getPosition()
             setBy = room.getSetBy()
-            watcher.sendState(position, paused, doSeek, setBy, forcedUpdate)
+            speed = room.getSpeed()
+            watcher.sendState(position, paused, doSeek, setBy, forcedUpdate, speed)
 
     def getFeatures(self):
         features = dict()
@@ -182,12 +183,14 @@ class SyncFactory(Factory):
         if room.canControl(watcher):
             paused, position = room.isPaused(), watcher.getPosition()
             setBy = watcher
-            l = lambda w: w.sendState(position, paused, doSeek, setBy, True)
+            speed = watcher.getSpeed()
+            l = lambda w: w.sendState(position, paused, doSeek, setBy, True, speed)
             room.setPosition(watcher.getPosition(), setBy)
+            room.setSpeed(speed, setBy)
             self._roomManager.broadcastRoom(watcher, l)
         else:
-            watcher.sendState(room.getPosition(), watcherPauseState, False, watcher, True)  # Fixes BC break with 1.2.x
-            watcher.sendState(room.getPosition(), room.isPaused(), True, room.getSetBy(), True)
+            watcher.sendState(room.getPosition(), watcherPauseState, False, watcher, True, watcher.getSpeed())  # Fixes BC break with 1.2.x
+            watcher.sendState(room.getPosition(), room.isPaused(), True, room.getSetBy(), True, room.getSpeed())
 
     def getAllWatchersForUser(self, forUser):
         return self._roomManager.getAllWatchersForUser(forUser)
@@ -551,6 +554,7 @@ class Room(object):
         self._lastUpdate = time.time()
         self._lastSavedUpdate = 0
         self._position = 0
+        self._speed = 1.0
         self._permanent = False
 
     def __str__(self, *args, **kwargs):
@@ -601,10 +605,11 @@ class Room(object):
             watcher = min(self._watchers.values())
             self._setBy = watcher
             self._position = watcher.getPosition()
+            self._speed = watcher.getSpeed()
             self._lastSavedUpdate = self._lastUpdate = time.time()
             return self._position
         elif self._position is not None:
-            return self._position + (age if self._playState == self.STATE_PLAYING else 0)
+            return self._position + (age * self.getSpeed() if self._playState == self.STATE_PLAYING else 0)
         else:
             return 0
 
@@ -619,6 +624,13 @@ class Room(object):
             watcher.setPosition(position)
             self._setBy = setBy
         self.writeToDb()
+
+    def setSpeed(self, speed, setBy=None):
+        self._speed = speed if speed is not None else 1.0
+        self._setBy = setBy
+
+    def getSpeed(self):
+        return self._speed if self._speed is not None else 1.0
 
     def setPermanent(self, newState):
         self._permanent = newState
@@ -684,10 +696,11 @@ class ControlledRoom(Room):
             watcher = min(self._controllers.values())
             self._setBy = watcher
             self._position = watcher.getPosition()
+            self._speed = watcher.getSpeed()
             self._lastUpdate = time.time()
             return self._position
         elif self._position is not None:
-            return self._position + (age if self._playState == self.STATE_PLAYING else 0)
+            return self._position + (age * self.getSpeed() if self._playState == self.STATE_PLAYING else 0)
         else:
             return 0
 
@@ -732,6 +745,7 @@ class Watcher(object):
         self._room = None
         self._file = None
         self._position = None
+        self._speed = 1.0
         self._lastUpdatedOn = time.time()
         self._sendStateTimer = None
         self._connector.setWatcher(self)
@@ -778,6 +792,9 @@ class Watcher(object):
     def setPosition(self, position):
         self._position = position
 
+    def setSpeed(self, speed):
+        self._speed = speed if speed is not None else 1.0
+
     def getPosition(self):
         if self._position is None:
             return None
@@ -785,7 +802,10 @@ class Watcher(object):
             timePassedSinceSet = time.time() - self._lastUpdatedOn
         else:
             timePassedSinceSet = 0
-        return self._position + timePassedSinceSet
+        return self._position + (timePassedSinceSet * self.getSpeed())
+
+    def getSpeed(self):
+        return self._speed if self._speed is not None else 1.0
 
     def sendSetting(self, user, room, file_, event):
         self._connector.sendUserSetting(user, room, file_, event)
@@ -856,9 +876,9 @@ class Watcher(object):
         if self._sendStateTimer and self._sendStateTimer.running:
             self._sendStateTimer.stop()
 
-    def sendState(self, position, paused, doSeek, setBy, forcedUpdate):
+    def sendState(self, position, paused, doSeek, setBy, forcedUpdate, speed=1.0):
         if self._connector.isLogged():
-            self._connector.sendState(position, paused, doSeek, setBy, forcedUpdate)
+            self._connector.sendState(position, paused, doSeek, setBy, forcedUpdate, speed)
         if time.time() - self._lastUpdatedOn > constants.PROTOCOL_TIMEOUT:
             self._server.removeWatcher(self)
             self._connector.drop()
@@ -868,20 +888,23 @@ class Watcher(object):
             return False
         return self._room.isPaused() and not paused or not self._room.isPaused() and paused
 
-    def _updatePositionByAge(self, messageAge, paused, position):
+    def _updatePositionByAge(self, messageAge, paused, position, speed):
         if not paused:
-            position += messageAge
+            position += messageAge * speed
         return position
 
-    def updateState(self, position, paused, doSeek, messageAge):
+    def updateState(self, position, paused, doSeek, messageAge, speed=1.0):
         pauseChanged = self.__hasPauseChanged(paused)
+        speedChanged = abs(self.getRoom().getSpeed() - speed) > 0.01
         self._lastUpdatedOn = time.time()
         if pauseChanged:
             self.getRoom().setPaused(Room.STATE_PAUSED if paused else Room.STATE_PLAYING, self)
         if position is not None:
-            position = self._updatePositionByAge(messageAge, paused, position)
+            position = self._updatePositionByAge(messageAge, paused, position, speed)
             self.setPosition(position)
-        if doSeek or pauseChanged:
+            self.setSpeed(speed)
+            self.getRoom().setSpeed(speed, self)
+        if doSeek or pauseChanged or speedChanged:
             self._server.forcePositionUpdate(self, doSeek, paused)
 
     def isController(self):
