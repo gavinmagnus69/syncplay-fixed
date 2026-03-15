@@ -56,6 +56,9 @@ class BasePlayer(object):
     def setSpeed(self, value):
         raise NotImplementedError()
 
+    def getSpeed(self):
+        return 1.0
+
     '''
     @type filePath: string
     '''
