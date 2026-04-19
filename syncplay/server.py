@@ -138,9 +138,11 @@ class SyncFactory(Factory):
             self.sendRoomSwitchMessage(watcher)
 
         room = watcher.getRoom()
-        roomSetByName = room.getSetBy().getName() if room.getSetBy() else None
+        roomSetByName = room.getSetBy().getName() if room.getSetBy() else watcher.getName()
         watcher.setPlaylist(roomSetByName, room.getPlaylist())
         watcher.setPlaylistIndex(roomSetByName, room.getPlaylistIndex())
+        if room._hasRestoredSession:
+            watcher.setPendingSeek(room.getPosition())
         if RoomPasswordProvider.isControlledRoom(roomName):
             for controller in room.getControllers():
                 watcher.sendControlledRoomAuthStatus(True, controller, roomName)
@@ -764,6 +766,7 @@ class Watcher(object):
         self._speed = 1.0
         self._lastUpdatedOn = time.time()
         self._sendStateTimer = None
+        self._pendingSeekPosition = None
         self._connector.setWatcher(self)
         reactor.callLater(0.1, self._scheduleSendState)
 
@@ -879,7 +882,16 @@ class Watcher(object):
         self._sendStateTimer = task.LoopingCall(self._askForStateUpdate)
         self._sendStateTimer.start(constants.SERVER_STATE_INTERVAL)
 
+    def setPendingSeek(self, position):
+        self._pendingSeekPosition = position
+
     def _askForStateUpdate(self, doSeek=False, forcedUpdate=False):
+        if self._pendingSeekPosition is not None and self._file:
+            self.setPosition(self._pendingSeekPosition)
+            self._room.setPosition(self._pendingSeekPosition, self)
+            self._pendingSeekPosition = None
+            doSeek = True
+            forcedUpdate = True
         self._server.sendState(self, doSeek, forcedUpdate)
 
     def _resetStateTimer(self):
