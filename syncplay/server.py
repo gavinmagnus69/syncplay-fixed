@@ -138,9 +138,11 @@ class SyncFactory(Factory):
             self.sendRoomSwitchMessage(watcher)
 
         room = watcher.getRoom()
-        roomSetByName = room.getSetBy().getName() if room.getSetBy() else None
+        roomSetByName = room.getSetBy().getName() if room.getSetBy() else watcher.getName()
         watcher.setPlaylist(roomSetByName, room.getPlaylist())
         watcher.setPlaylistIndex(roomSetByName, room.getPlaylistIndex())
+        if room._hasRestoredSession:
+            watcher.setPendingSeek(room.getPosition())
         if RoomPasswordProvider.isControlledRoom(roomName):
             for controller in room.getControllers():
                 watcher.sendControlledRoomAuthStatus(True, controller, roomName)
@@ -416,6 +418,7 @@ class RoomManager(object):
     def __init__(self, roomsdbfile=None, permanentRooms=[]):
         self._roomsDbFile = roomsdbfile
         self._rooms = {}
+        self._roomSessions = {}
         self._permanentRooms = permanentRooms
         if self._roomsDbFile is not None:
             self._roomsDbHandle = RoomDBManager(self._roomsDbFile, self.loadRooms)
@@ -492,9 +495,9 @@ class RoomManager(object):
             if RoomPasswordProvider.isControlledRoom(roomName):
                 room = ControlledRoom(roomName, self._roomsDbHandle)
             else:
-                if roomName in self._rooms:
-                    self._deleteRoomIfEmpty(self._rooms[roomName])
                 room = Room(roomName, self._roomsDbHandle)
+            if roomName in self._roomSessions:
+                room.restoreSession(self._roomSessions.pop(roomName))
             self._rooms[roomName] = room
             return room
 
@@ -506,6 +509,12 @@ class RoomManager(object):
                 if room.isPersistent() and not room.isPlaylistEmpty():
                     return
                 self._roomsDbHandle.deleteRoom(room.getName())
+            if not room.isPlaylistEmpty():
+                self._roomSessions[room.getName()] = {
+                    'playlist': room.getPlaylist(),
+                    'playlistIndex': room.getPlaylistIndex(),
+                    'position': room.getPosition(),
+                }
             del self._rooms[room.getName()]
 
     def findFreeUsername(self, username, maxUsernameLength=constants.MAX_USERNAME_LENGTH):
@@ -556,6 +565,7 @@ class Room(object):
         self._position = 0
         self._speed = 1.0
         self._permanent = False
+        self._hasRestoredSession = False
 
     def __str__(self, *args, **kwargs):
         return self.getName()
@@ -595,6 +605,13 @@ class Room(object):
         self._playlistIndex = playlistindex
         self._position = position
         self._lastSavedUpdate = lastupdate
+
+    def restoreSession(self, session):
+        self._playlist = session['playlist']
+        self._playlistIndex = session['playlistIndex']
+        self._position = session['position']
+        self._playState = self.STATE_PAUSED
+        self._hasRestoredSession = True
 
     def getName(self):
         return self._name
@@ -645,7 +662,7 @@ class Room(object):
         return list(self._watchers.values())
 
     def addWatcher(self, watcher):
-        if self._watchers or self.isPersistent():
+        if self._watchers or self.isPersistent() or self._hasRestoredSession:
             watcher.setPosition(self.getPosition())
         self._watchers[watcher.getName()] = watcher
         watcher.setRoom(self)
@@ -653,10 +670,11 @@ class Room(object):
     def removeWatcher(self, watcher):
         if watcher.getName() not in self._watchers:
             return
+        if len(self._watchers) == 1:
+            self._position = self.getPosition()
+            self._playState = self.STATE_PAUSED
         del self._watchers[watcher.getName()]
         watcher.setRoom(None)
-        if not self._watchers and not self.isPersistent():
-            self._position = 0
         self.writeToDb()
 
     def isEmpty(self):
@@ -748,6 +766,7 @@ class Watcher(object):
         self._speed = 1.0
         self._lastUpdatedOn = time.time()
         self._sendStateTimer = None
+        self._pendingSeekPosition = None
         self._connector.setWatcher(self)
         reactor.callLater(0.1, self._scheduleSendState)
 
@@ -863,7 +882,16 @@ class Watcher(object):
         self._sendStateTimer = task.LoopingCall(self._askForStateUpdate)
         self._sendStateTimer.start(constants.SERVER_STATE_INTERVAL)
 
+    def setPendingSeek(self, position):
+        self._pendingSeekPosition = position
+
     def _askForStateUpdate(self, doSeek=False, forcedUpdate=False):
+        if self._pendingSeekPosition is not None and self._file:
+            self.setPosition(self._pendingSeekPosition)
+            self._room.setPosition(self._pendingSeekPosition, self)
+            self._pendingSeekPosition = None
+            doSeek = True
+            forcedUpdate = True
         self._server.sendState(self, doSeek, forcedUpdate)
 
     def _resetStateTimer(self):
